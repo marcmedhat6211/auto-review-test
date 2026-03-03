@@ -18,34 +18,71 @@ jobs:
           fetch-depth: 0
 
       - name: Get PR diff
-        id: diff
         run: |
           git diff origin/${{ github.base_ref }}...HEAD > pr_diff.txt
-          echo "Diff size: $(wc -l < pr_diff.txt) lines"
+          echo "Lines in diff: $(wc -l < pr_diff.txt)"
 
       - name: Run AI Code Review
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          DIFF_CONTENT=$(cat pr_diff.txt)
+          # Write the prompt to a file to avoid shell escaping issues
+          cat pr_diff.txt | head -c 10000 > trimmed_diff.txt
+          DIFF=$(cat trimmed_diff.txt)
 
-          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+          # Build JSON payload safely using a Python script
+          python3 -c "
+          import json, sys
+
+          diff = open('trimmed_diff.txt').read()
+
+          payload = {
+            'model': 'claude-haiku-4-5-20251001',
+            'max_tokens': 1024,
+            'messages': [{
+              'role': 'user',
+              'content': '''You are an experienced software engineer doing a code review.
+          Review the following git diff and provide feedback on:
+          - Bugs or logic errors
+          - Security concerns
+          - Performance issues
+          - Code readability and naming
+          - Anything incomplete or risky
+
+          Be concise and practical. Use markdown. If something looks good, say so briefly.
+
+          Diff:
+          ''' + diff
+            }]
+          }
+
+          print(json.dumps(payload))
+          " > payload.json
+
+          echo "Payload size: $(wc -c < payload.json) bytes"
+
+          # Call the API
+          curl -s https://api.anthropic.com/v1/messages \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
             -H "content-type: application/json" \
-            -d "$(jq -n \
-              --arg diff "$DIFF_CONTENT" \
-              '{
-                model: "claude-haiku-4-5-20251001",
-                max_tokens: 1024,
-                messages: [{
-                  role: "user",
-                  content: ("You are an experienced software engineer doing a code review.\nReview the following git diff and provide feedback on:\n- Bugs or logic errors\n- Security concerns\n- Performance issues\n- Code readability and naming\n- Anything incomplete or risky\n\nBe concise and practical. Format your response in markdown with clear sections. If the code looks good, say so briefly.\n\nDiff:\n" + $diff)
-                }]
-              }'
-            )")
+            -d @payload.json > api_response.json
 
-          echo "$RESPONSE" | jq -r '.content[0].text' > review_comment.txt
+          echo "=== API Response ==="
+          cat api_response.json
+
+          # Extract the review text
+          python3 -c "
+          import json, sys
+          data = json.load(open('api_response.json'))
+          if 'content' in data:
+              print(data['content'][0]['text'])
+          else:
+              print('API Error: ' + json.dumps(data))
+          " > review_comment.txt
+
+          echo "=== Review ==="
+          cat review_comment.txt
 
       - name: Post comment on PR
         env:
@@ -55,7 +92,7 @@ jobs:
           gh pr comment ${{ github.event.pull_request.number }} \
             --body "## 🤖 AI Code Review
 
-          $COMMENT_BODY
+          ${COMMENT_BODY}
 
           ---
-          *Reviewed by Claude Haiku · [StreamLine Demo]*"
+          *Reviewed by Claude Haiku · StreamLine Demo*"
